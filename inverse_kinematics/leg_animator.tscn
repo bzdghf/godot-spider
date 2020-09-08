@@ -1,0 +1,184 @@
+[gd_scene load_steps=4 format=2]
+
+[ext_resource path="res://inverse_kinematics/inverse_kinematic_solver.tscn" type="PackedScene" id=1]
+
+[sub_resource type="GDScript" id=1]
+script/source = "tool
+extends Spatial
+
+export (NodePath) var rest_position_path
+export (NodePath) var ray_cast_position_path
+export(NodePath) var pole_position_path
+export(NodePath) var pole_rotation_path
+export(NodePath) var root_joint_path setget _set_root_joint_path
+
+export var step_interval_ms = 400.0
+export var step_clock_offset_ms = 200.0
+export var step_duration_ms = 100.0
+export var step_height = 0.5
+export var step_prediction_ratio = 1.0
+export var step_min_distance = 0.3
+var step_min_distance_squared = step_min_distance*step_min_distance # use squared value to avoid root calculations
+var previous_step_time = 0
+var target_position = Vector3.ZERO
+var next_position = Vector3.ZERO
+var previous_position = Vector3.ZERO
+# debug
+onready var target_debug = _make_mesh(Color(0, 1, 0))
+onready var next_position_debug = _make_mesh(Color(0, 0, 1))
+onready var previous_position_debug = _make_mesh(Color(1, 0, 0))
+
+func _make_mesh(color):
+	var mesh_instance = MeshInstance.new()
+	add_child(mesh_instance)
+	mesh_instance.mesh = SphereMesh.new()
+	mesh_instance.global_scale(Vector3(0.1, 0.1, 0.1))
+	var material = SpatialMaterial.new()
+	material.albedo_color = color
+	mesh_instance.material_override = material
+	return mesh_instance
+
+func _set_root_joint_path(node_path):
+	root_joint_path = node_path
+	if node_path and previous_step_time != 0:
+		var joints = _extract_joints(get_node(root_joint_path))
+		$inverse_kinematic_solver.set_joints(joints)
+
+func _ready():
+	var joints = _extract_joints(get_node(root_joint_path))
+	$inverse_kinematic_solver.set_joints(joints)
+
+func _extract_joints(root_joint_node):
+	var current_node = root_joint_node
+	var joints = []
+	while current_node != null:
+		var prev_node = current_node
+		current_node = null
+		for child in prev_node.get_children():
+			if child is BoneAttachment:
+				current_node = child
+				joints.append(child)
+	print('found ', joints.size(), ' joints')
+	return joints
+
+var previous_tick = 0
+func _process(delta):
+	var rest_position = get_node(rest_position_path).global_transform.origin
+	var ray_cast_position = get_node(ray_cast_position_path).global_transform.origin
+	var current_time = OS.get_ticks_msec()
+	var tick = floor((current_time+step_clock_offset_ms) / step_interval_ms) # adding offset helps this instance to get its next tick earlier than instances without offset
+	# update cast positions
+#	if current_time - previous_step_time >= step_interval_ms:
+	if tick - previous_tick > 0:
+		previous_step_time = current_time
+		previous_tick = tick
+		var cast_start = ray_cast_position
+		var cast_end = rest_position
+		var last_step_delta = rest_position - previous_position # use delta to rest position instead of previous end position, otherwise predictions are too late
+		cast_end += step_prediction_ratio * last_step_delta
+		cast_end += Vector3.DOWN * 2 # ensure we cast to under the surface, this shouldnt be too large because it effects movement_prediction (triangle to cast_end)
+		var cast_result = get_world().direct_space_state.intersect_ray(cast_start, cast_end)
+		previous_position = next_position
+		next_position = cast_result.position if cast_result else rest_position
+	# interpolate target to new position
+	if previous_position.distance_squared_to(next_position) > step_min_distance_squared:
+		var transition_ratio = min(1, (current_time - previous_step_time) / step_duration_ms)
+		target_position = lerp(previous_position, next_position, transition_ratio)
+		target_position.y += step_height - abs(lerp(-step_height, step_height, transition_ratio))
+#	else: # small jittering feels unnatural, better not move at all
+#		$target.global_transform.origin = $current_position.global_transform.origin
+	# solve ik position to target 
+	$inverse_kinematic_solver.iteration_count = 1
+	$inverse_kinematic_solver.target_position = target_position
+	$inverse_kinematic_solver.pole_position = get_node(pole_position_path).global_transform.origin
+	$inverse_kinematic_solver.pole_rotation = get_node(pole_rotation_path).global_transform.origin
+	$inverse_kinematic_solver.update_joint_transforms()
+	if Engine.is_editor_hint():
+		target_debug.global_transform.origin = target_position
+		next_position_debug.global_transform.origin = next_position
+		previous_position_debug.global_transform.origin = previous_position
+"
+
+[sub_resource type="GDScript" id=2]
+script/source = "# translated from unity ik: https://www.youtube.com/watch?v=qqOAzn05fvk
+tool
+extends Skeleton
+
+#export (NodePath) var root_joint_path setget _set_root_node
+export var iteration_count = 10
+export var target_position = Vector3.ZERO
+export var pole_position = Vector3.ZERO
+export var pole_rotation = Vector3.ZERO
+var joints = []
+var joint_lengths = 0
+var positions = []
+var max_length = 0
+
+func set_joints(joints): # there is ordering to joints. joints[0] is root
+	self.joints = joints
+	joint_lengths = []
+	max_length = 0
+	for i in range(1, joints.size()):
+		joint_lengths.append((joints[i].global_transform.origin - joints[i-1].global_transform.origin).length())
+		max_length += joint_lengths[joint_lengths.size()-1]
+	positions = []
+	for joint in joints:
+		positions.append(joint.global_transform.origin)
+
+func update_joint_transforms():
+	if !joints or joints.size() == 0:
+		return
+	for i in range (0, joints.size()):
+		positions[i] = joints[i].global_transform.origin
+#	full stretch:
+	if joints[0].global_transform.origin.distance_squared_to(target_position) >= max_length*max_length:
+		var direction = (target_position - positions[0]).normalized()
+		for i in range(1, positions.size()):
+			positions[i] = positions[i-1] + direction * joint_lengths[i-1]
+	else:
+		for i in range(iteration_count):
+			# backward
+			var epsilon = 0.01
+			if positions[positions.size()-1].distance_squared_to(target_position) < epsilon*epsilon:
+				break
+			for i in range(positions.size()-1, 0, -1):
+				if i == positions.size()-1:
+					positions[i] = target_position
+				else:
+					positions[i] = positions[i+1] + (positions[i] - positions[i+1]).normalized() * joint_lengths[i]
+			# forward
+			for i in range(1, positions.size()):
+				positions[i] = positions[i-1] + (positions[i] - positions[i-1]).normalized() * joint_lengths[i-1]
+	for i in range (1, positions.size()-1): # we can only move the middle joints (towards pole)
+		var normal = (positions[i+1]-positions[i-1]).normalized()
+		var plane = Plane(normal, positions[i-1].dot(normal)) # put a plane on i-1 so we can check how much middle node must be rotated to reach pole projection on the plane
+		var projected_pole = plane.project(pole_position)
+		var projected_joint = plane.project(positions[i])
+		var angle = (projected_joint-positions[i-1]).angle_to(projected_pole-positions[i-1])
+		if (projected_joint-positions[i-1]).cross(projected_pole-positions[i-1]).dot(plane.normal) < 0: # need signed angle
+			angle = -angle
+		positions[i] = Quat(normal, angle).normalized() * (positions[i] - positions[i-1]) + positions[i-1]
+	for i in range (0, joints.size()):
+		joints[i].global_transform.origin = positions[i]
+		var next_position = positions[i+1] if i < joints.size()-1 else target_position
+		var up = pole_rotation - positions[i] # keep up directed at pole
+		joints[i].look_at(next_position, up)
+
+#func quat_from_to_rotation(from, to):
+#	var axis = from.cross(to).normalized()
+#	var angle = from.angle_to(to)
+#	var quat = Quat(axis, angle)
+#	return quat
+"
+
+[node name="leg_animator" type="Spatial"]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.22896 )
+script = SubResource( 1 )
+step_prediction_ratio = 0.5
+
+[node name="inverse_kinematic_solver" parent="." instance=ExtResource( 1 )]
+transform = Transform( -1.62921e-07, 0, 1, 0, 1, 0, -1, 0, -1.62921e-07, -0.443955, 1.27712, -1.66315 )
+script = SubResource( 2 )
+target_position = Vector3( -2.05167, 0.411238, -1.27402 )
+pole_position = Vector3( -1.4306, 2.65326, -1.34367 )
+pole_rotation = Vector3( -1.4306, 2.04545, -1.34367 )

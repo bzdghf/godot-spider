@@ -1,0 +1,219 @@
+[gd_scene load_steps=11 format=2]
+
+[ext_resource path="res://resources/checkerboard.shader" type="Shader" id=1]
+[ext_resource path="res://inverse_kinematics/inverse_kinematic_solver.tscn" type="PackedScene" id=2]
+
+[sub_resource type="GDScript" id=1]
+script/source = "tool
+extends Spatial
+
+export (NodePath) var rest_position_path
+export (NodePath) var ray_cast_position_path
+export(NodePath) var pole_position_path
+export(NodePath) var pole_rotation_path
+export(NodePath) var root_joint_path setget _set_root_joint_path
+
+export var step_interval_ms = 400.0
+export var step_duration_ms = 100.0
+export var step_height = 0.5
+export var step_prediction_ratio = 1.0
+export var step_min_distance = 0.3
+var step_min_distance_squared = step_min_distance*step_min_distance # use squared value to avoid root calculations
+var previous_step_time = 0
+var target_position = Vector3.ZERO
+var next_position = Vector3.ZERO
+var previous_position = Vector3.ZERO
+# debug
+onready var target_debug = _make_mesh(Color(0, 1, 0))
+onready var next_position_debug = _make_mesh(Color(0, 0, 1))
+onready var previous_position_debug = _make_mesh(Color(1, 0, 0))
+
+func _make_mesh(color):
+	var mesh_instance = MeshInstance.new()
+	add_child(mesh_instance)
+	mesh_instance.mesh = SphereMesh.new()
+	mesh_instance.global_scale(Vector3(0.1, 0.1, 0.1))
+	var material = SpatialMaterial.new()
+	material.albedo_color = color
+	mesh_instance.material_override = material
+	return mesh_instance
+
+func _set_root_joint_path(node_path):
+	root_joint_path = node_path
+	if node_path and previous_step_time != 0:
+		var joints = _extract_joints(get_node(root_joint_path))
+		$inverse_kinematic_solver.set_joints(joints)
+
+func _ready():
+	var joints = _extract_joints(get_node(root_joint_path))
+	$inverse_kinematic_solver.set_joints(joints)
+
+func _extract_joints(root_joint_node):
+	var current_node = root_joint_node
+	var joints = []
+	while current_node != null:
+		var prev_node = current_node
+		current_node = null
+		for child in prev_node.get_children():
+			if child is BoneAttachment:
+				current_node = child
+				joints.append(child)
+	print('found ', joints.size(), ' joints')
+	return joints
+
+func _process(delta):
+	var rest_position = get_node(rest_position_path).global_transform.origin
+	var ray_cast_position = get_node(ray_cast_position_path).global_transform.origin
+#	if Engine.is_editor_hint(): _ready() # avoid restarting editor
+	var current_time = OS.get_ticks_msec()
+	# update cast positions
+	if current_time - previous_step_time >= step_interval_ms:
+		previous_step_time = current_time
+		var cast_start = ray_cast_position
+		var cast_end = rest_position
+		var last_step_delta = rest_position - previous_position # use delta to rest position instead of previous end position, otherwise predictions are too late
+		cast_end += step_prediction_ratio * last_step_delta
+		cast_end += Vector3.DOWN * 2 # ensure we cast to under the surface, this shouldnt be too large because it effects movement_prediction (triangle to cast_end)
+		var cast_result = get_world().direct_space_state.intersect_ray(cast_start, cast_end)
+		previous_position = next_position
+		next_position = cast_result.position if cast_result else rest_position
+	# interpolate target to new position
+	if previous_position.distance_squared_to(next_position) > step_min_distance_squared:
+		var transition_ratio = min(1, (current_time - previous_step_time) / step_duration_ms)
+		target_position = lerp(previous_position, next_position, transition_ratio)
+		target_position.y += step_height - abs(lerp(-step_height, step_height, transition_ratio))
+#	else: # small jittering feels unnatural, better not move at all
+#		$target.global_transform.origin = $current_position.global_transform.origin
+	# solve ik position to target 
+	$inverse_kinematic_solver.iteration_count = 1
+	$inverse_kinematic_solver.target_position = target_position
+	$inverse_kinematic_solver.pole_position = get_node(pole_position_path).global_transform.origin
+	$inverse_kinematic_solver.pole_rotation = get_node(pole_rotation_path).global_transform.origin
+	$inverse_kinematic_solver.update_joint_transforms()
+	if Engine.is_editor_hint():
+		target_debug.global_transform.origin = target_position
+		next_position_debug.global_transform.origin = next_position
+		previous_position_debug.global_transform.origin = previous_position
+"
+
+[sub_resource type="CubeMesh" id=2]
+size = Vector3( 0.2, 0.2, 1 )
+
+[sub_resource type="Environment" id=3]
+background_mode = 1
+ambient_light_color = Color( 0.443137, 0.443137, 0.443137, 1 )
+
+[sub_resource type="PlaneMesh" id=4]
+size = Vector2( 20, 20 )
+
+[sub_resource type="ShaderMaterial" id=5]
+shader = ExtResource( 1 )
+shader_param/albedo = Color( 0.180392, 0.180392, 0.180392, 1 )
+shader_param/squares = 1.0
+shader_param/edge_blur = 1.0
+shader_param/specular = null
+shader_param/metallic = 0.0
+shader_param/roughness = 1.0
+shader_param/point_size = null
+
+[sub_resource type="ConcavePolygonShape" id=6]
+data = PoolVector3Array( 10, 0, 10, -10, 0, 10, 10, 0, -10, -10, 0, 10, -10, 0, -10, 10, 0, -10 )
+
+[sub_resource type="SphereMesh" id=7]
+radius = 0.5
+height = 1.0
+
+[sub_resource type="SphereShape" id=8]
+radius = 0.5
+
+[node name="demo" type="Node"]
+
+[node name="creature_controller" type="Spatial" parent="."]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, 0.287161, 0, 0.578431 )
+
+[node name="leg_animator" type="Spatial" parent="creature_controller"]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.22896 )
+script = SubResource( 1 )
+rest_position_path = NodePath("../rest_position")
+ray_cast_position_path = NodePath("../ray_cast_position")
+pole_position_path = NodePath("../pole_position")
+pole_rotation_path = NodePath("../pole_rotation")
+root_joint_path = NodePath("../joint")
+step_interval_ms = 400.0
+step_duration_ms = 100.0
+step_height = 0.5
+step_prediction_ratio = 0.5
+step_min_distance = 0.3
+
+[node name="inverse_kinematic_solver" parent="creature_controller/leg_animator" instance=ExtResource( 2 )]
+transform = Transform( -1.62921e-07, 0, 1, 0, 1, 0, -1, 0, -1.62921e-07, -0.443955, 1.27712, -1.66315 )
+target_position = Vector3( -1.94711, 0, -0.995644 )
+pole_position = Vector3( -1.14344, 2.65326, -1.01799 )
+pole_rotation = Vector3( -1.14344, 2.04545, -1.01799 )
+
+[node name="pole_position" type="Position3D" parent="creature_controller"]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -1.4306, 2.65326, -1.59642 )
+
+[node name="pole_rotation" type="Position3D" parent="creature_controller"]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -1.4306, 2.04545, -1.59642 )
+
+[node name="rest_position" type="Position3D" parent="creature_controller"]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -2.57291, 0.0623209, -1.5626 )
+
+[node name="ray_cast_position" type="Position3D" parent="creature_controller"]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -1.8317, 1.59827, -1.58852 )
+
+[node name="joint" type="BoneAttachment" parent="creature_controller"]
+transform = Transform( 0.00739333, 0.0722536, 0.997167, 0.0507115, 0.995911, -0.0725349, -0.997621, 0.0511601, 0.00370284, -0.145906, 1.42988, -1.61819 )
+
+[node name="MeshInstance" type="MeshInstance" parent="creature_controller/joint"]
+transform = Transform( 1, -6.42426e-06, 2.85953e-05, 6.42613e-06, 1, 7.10599e-07, -2.85804e-05, -6.9011e-07, 1, 3.24249e-05, -1.78814e-06, -0.499994 )
+mesh = SubResource( 2 )
+material/0 = null
+
+[node name="joint" type="BoneAttachment" parent="creature_controller/joint"]
+transform = Transform( 0.994689, -0.0135087, 0.0807247, -0.0357256, 0.81218, 0.579075, -0.0734371, -0.578081, 0.81169, -0.000110149, 1.46627e-05, -1.07391 )
+
+[node name="MeshInstance" type="MeshInstance" parent="creature_controller/joint/joint"]
+transform = Transform( 1, 0, 7.45058e-09, 7.45058e-09, 1, 2.79397e-09, 7.45058e-09, 2.51457e-08, 1, 4.76837e-07, -2.38419e-07, -0.5 )
+mesh = SubResource( 2 )
+material/0 = null
+
+[node name="joint" type="BoneAttachment" parent="creature_controller/joint/joint"]
+transform = Transform( -0.999432, -0.0217039, 0.00849484, 0.0207045, -0.657099, 0.751701, -0.0107593, 0.751594, 0.657438, -0.000141978, 2.99215e-05, -0.997697 )
+
+[node name="MeshInstance2" type="MeshInstance" parent="creature_controller/joint/joint/joint"]
+transform = Transform( 1, -0.000118151, -7.96393e-05, 0.000118166, 1, -3.14424e-05, 7.96542e-05, 3.15653e-05, 1, -4.1008e-05, -1.5676e-05, -0.5 )
+mesh = SubResource( 2 )
+material/0 = null
+
+[node name="joint" type="BoneAttachment" parent="creature_controller/joint/joint/joint"]
+transform = Transform( 0.998864, -0.0103726, 0.00215022, 0.0103668, 0.998958, 0.00225561, -0.00217044, -0.00223021, 1.00033, 2.69413e-05, 0.0033232, -1.00367 )
+
+[node name="environment" type="WorldEnvironment" parent="."]
+environment = SubResource( 3 )
+
+[node name="light" type="DirectionalLight" parent="environment"]
+transform = Transform( -0.119471, 0.629567, -0.767705, 0.128496, 0.776545, 0.61682, 0.984487, -0.024955, -0.173672, -7.88634, 4.27265, 0 )
+
+[node name="camera" type="Camera" parent="."]
+transform = Transform( -1.62921e-07, 0.34202, -0.939693, 0, 0.939693, 0.34202, 1, 5.57222e-08, -1.53095e-07, -6, 2, 0 )
+
+[node name="StaticBody" type="StaticBody" parent="."]
+
+[node name="floor" type="MeshInstance" parent="StaticBody"]
+mesh = SubResource( 4 )
+material/0 = SubResource( 5 )
+
+[node name="CollisionShape" type="CollisionShape" parent="StaticBody"]
+shape = SubResource( 6 )
+
+[node name="StaticBody2" type="StaticBody" parent="."]
+transform = Transform( 1, 0, 0, 0, 1, 0, 0, 0, 1, -2.01306, 0, -1.55644 )
+
+[node name="MeshInstance" type="MeshInstance" parent="StaticBody2"]
+mesh = SubResource( 7 )
+material/0 = null
+
+[node name="CollisionShape" type="CollisionShape" parent="StaticBody2"]
+shape = SubResource( 8 )
